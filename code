@@ -1,0 +1,549 @@
+#include <Arduino.h>
+#include <WiFi.h>
+
+// ── WIFI / TCP CONFIG ──
+#define WIFI_SSID     "Samehs iphone"
+#define WIFI_PASS     "Sameh1234"
+#define TCP_PORT      23
+
+IPAddress localIP(172, 20, 10, 12);
+IPAddress gateway(172, 20, 10, 1);
+IPAddress subnet(255, 255, 255, 240);
+IPAddress dns(8, 8, 8, 8);
+
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient tcpClient;
+
+// ── PWM CHANNELS ──
+#define CHAN_A 0
+#define CHAN_B 1
+
+// ── MOTOR DRIVER PINS ──
+#define MOTOR_ENABLE  13
+#define PWM_WHEEL_L   26
+#define PWM_WHEEL_R   32
+#define ML_FWD        27
+#define ML_REV        14
+#define MR_FWD        33
+#define MR_REV        25
+
+// ── IR SENSOR INPUTS ──
+#define IR_A  23
+#define IR_B  22
+#define IR_C  21
+#define IR_D  19
+#define IR_E  18
+
+#define TICK_FREQ 1000
+#define TICK_BITS 8
+
+// ==================================================
+// SPEED CONSTANTS
+// ==================================================
+const int SPD_BASE    = 135;
+const int SPD_BOTTOM  = 80;
+const int SPD_TOP     = 205;
+const int SPD_ROTATE  = 130;
+const int SPD_CREEP   = 100;
+
+// ==================================================
+// PID CORRECTION STEPS
+// ==================================================
+const int STEP_1 = 55;
+const int STEP_2 = 60;
+const int STEP_3 = 65;
+const int STEP_4 = 70;
+
+// ==================================================
+// TIMING CONSTANTS
+// ==================================================
+const unsigned long T_BRAKE      = 25;
+const unsigned long T_CREEP_JCT  = 220;
+const unsigned long T_CREEP_PEEK = 130;
+const unsigned long T_SPIN_MIN   = 500;
+const unsigned long T_SCAN_MAX   = 1700;
+const unsigned long T_CONFIRM    = 45;
+const unsigned long T_LINELOST   = 200;
+const unsigned long T_LOCKOUT    = 200;
+
+// ==================================================
+// RUNTIME STATE
+// ==================================================
+int           gLastErr = 0;
+unsigned long gLockEnd = 0;
+
+// ==================================================
+// ── PATH SYSTEM ───────────────────────────────────
+//
+//  Phase 1 – EXPLORE
+//    LHR navigation records every junction decision.
+//    After every turn, dead-end elimination collapses
+//    any  X → B → Y  triple into one equivalent turn,
+//    so gPath[] is always the shortest known path so far.
+//
+//  Elimination rule (angle arithmetic):
+//    combined = (angle(X) + 180 + angle(Y)) mod 360
+//    e.g.  L B S → ( 270+180+0 ) mod360 = 90 → R
+//          L B L → ( 270+180+270) mod360 =  0 → S
+//          S B R → (   0+180+90 ) mod360 = 270 → L
+//
+//  Phase 2 – REPLAY
+//    Robot is placed back at start.
+//    resolveJunction() consumes gPath[gPathIdx++] instead
+//    of deciding via LHR, so it executes the optimal path.
+// ==================================================
+#define MAX_PATH 512
+char  gPath[MAX_PATH];
+int   gPathLen   = 0;   // valid entries in gPath[]
+int   gPathIdx   = 0;   // replay read head
+bool  gExploring = true;
+
+// --- angle helpers ---
+int turnToAngle(char t) {
+  if (t == 'S') return 0;
+  if (t == 'R') return 90;
+  if (t == 'B') return 180;
+  return 270;  // 'L'
+}
+
+char angleToTurn(int a) {
+  a = ((a % 360) + 360) % 360;
+  if (a == 0)   return 'S';
+  if (a == 90)  return 'R';
+  if (a == 180) return 'B';
+  return 'L';  // 270
+}
+
+// Record one turn then immediately simplify dead ends.
+// Called only during exploration.
+void recordTurn(char t) {
+  if (gPathLen < MAX_PATH) gPath[gPathLen++] = t;
+
+  // Collapse X-B-Y into one turn repeatedly
+  while (gPathLen >= 3 && gPath[gPathLen - 2] == 'B') {
+    char simplified = angleToTurn(
+      turnToAngle(gPath[gPathLen - 3]) + 180 + turnToAngle(gPath[gPathLen - 1])
+    );
+    gPathLen -= 3;
+    if (gPathLen < MAX_PATH) gPath[gPathLen++] = simplified;
+  }
+}
+
+void printPath() {
+  char buf[MAX_PATH + 64];
+  int  pos = snprintf(buf, 64, "\n[OPTIMAL PATH] %d steps: ", gPathLen);
+  for (int i = 0; i < gPathLen && pos < (int)sizeof(buf) - 2; i++)
+    buf[pos++] = gPath[i];
+  buf[pos] = '\0';
+  tcpPrintln(buf);
+}
+
+// ==================================================
+// TCP HELPERS
+// ==================================================
+void tcpPrint(const char* msg) {
+  if (tcpClient && tcpClient.connected()) tcpClient.print(msg);
+  Serial.print(msg);
+}
+
+void tcpPrintf(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  tcpPrint(buf);
+}
+
+void tcpPrintln(const char* msg) {
+  if (tcpClient && tcpClient.connected()) tcpClient.println(msg);
+  Serial.println(msg);
+}
+
+// ==================================================
+// WHEEL & MOTOR HELPERS
+// ==================================================
+void whl_L_fwd() { digitalWrite(ML_FWD, LOW);  digitalWrite(ML_REV, HIGH); }
+void whl_L_rev() { digitalWrite(ML_FWD, HIGH); digitalWrite(ML_REV, LOW);  }
+void whl_R_fwd() { digitalWrite(MR_FWD, LOW);  digitalWrite(MR_REV, HIGH); }
+void whl_R_rev() { digitalWrite(MR_FWD, HIGH); digitalWrite(MR_REV, LOW);  }
+
+void driveFwd() { whl_L_fwd(); whl_R_fwd(); }
+void pivotCCW() { whl_L_rev(); whl_R_fwd(); }
+void pivotCW()  { whl_L_fwd(); whl_R_rev(); }
+
+void killMotors() {
+  ledcWrite(CHAN_A, 0);
+  ledcWrite(CHAN_B, 0);
+}
+
+void writePWM(int vL, int vR) {
+  ledcWrite(CHAN_A, (uint8_t)constrain(vL, 0, 255));
+  ledcWrite(CHAN_B, (uint8_t)constrain(vR, 0, 255));
+}
+
+// ==================================================
+// SENSOR HELPERS
+// ==================================================
+bool pollPin(int p) {
+  int n = 0;
+  for (int k = 0; k < 3; k++) {
+    if (digitalRead(p) == LOW) n++;
+    delayMicroseconds(150);
+  }
+  return n >= 2;
+}
+
+void snapshot(bool &a, bool &b, bool &c, bool &d, bool &e) {
+  a = pollPin(IR_A); b = pollPin(IR_B); c = pollPin(IR_C);
+  d = pollPin(IR_D); e = pollPin(IR_E);
+}
+
+int tally(bool a, bool b, bool c, bool d, bool e) {
+  return (int)a + b + c + d + e;
+}
+
+String mask(bool a, bool b, bool c, bool d, bool e) {
+  String s = "";
+  s += a?'1':'0'; s += b?'1':'0'; s += c?'1':'0';
+  s += d?'1':'0'; s += e?'1':'0';
+  return s;
+}
+
+bool lineUnderCenter() {
+  bool a,b,c,d,e;
+  snapshot(a,b,c,d,e);
+  return c || (b && d);
+}
+
+// ==================================================
+// TURN PRIMITIVES
+// ==================================================
+bool spinUntilLine(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (lineUnderCenter()) {
+      unsigned long th = millis();
+      while (millis() - th < T_CONFIRM)
+        if (!lineUnderCenter()) th = millis();
+      return true;
+    }
+  }
+  return false;
+}
+
+void armLockout() { gLockEnd = millis() + T_LOCKOUT; }
+
+bool applyHeading(char h) {
+  if (h == 'S') return true;
+  bool ok = false;
+  if (h == 'L') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    tcpPrintln(ok ? "[TURN] LEFT  OK" : "[TURN] LEFT  FAIL");
+    return ok;
+  }
+  if (h == 'R') {
+    pivotCW();  writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    tcpPrintln(ok ? "[TURN] RIGHT OK" : "[TURN] RIGHT FAIL");
+    return ok;
+  }
+  if (h == 'B') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN * 2);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    tcpPrintln(ok ? "[TURN] U-TURN OK" : "[TURN] U-TURN FAIL");
+    return ok;
+  }
+  return false;
+}
+
+// ==================================================
+// LINE FOLLOWING  (PID-style weighted error)
+// ==================================================
+void followLine(bool a, bool b, bool c, bool d, bool e) {
+  driveFwd();
+  const int wt[5] = {-2, -1, 0, 1, 2};
+  bool ir[5] = {a, b, c, d, e};
+  int num = 0, den = 0;
+  for (int i = 0; i < 5; i++) if (ir[i]) { num += wt[i]; den++; }
+  int err;
+  if (den > 0) { err = num; gLastErr = err; }
+  else          { err = (gLastErr < 0) ? -4 : (gLastErr > 0) ? 4 : 0; }
+  int ea  = abs(err);
+  int adj = (ea==0)?0:(ea==1)?STEP_1:(ea==2)?STEP_2:(ea==3)?STEP_3:STEP_4;
+  if (err < 0) adj = -adj;
+  writePWM(constrain(SPD_BASE + adj, SPD_BOTTOM, SPD_TOP),
+           constrain(SPD_BASE - adj, SPD_BOTTOM, SPD_TOP));
+}
+
+// ==================================================
+// BLOCKING COMMAND READER  (serial + TCP)
+// ==================================================
+void waitForCommand(const char* prompt, const char* cmd) {
+  tcpPrintln(prompt);
+  String input = "";
+  while (true) {
+    if (!tcpClient || !tcpClient.connected()) {
+      tcpClient = tcpServer.available();
+      if (tcpClient) tcpPrintln("[TCP] Client connected");
+    }
+    auto readChar = [&](char c) {
+      if (c == '\n' || c == '\r') {
+        input.trim();
+        if (input.equalsIgnoreCase(cmd)) input = "\x01"; // sentinel
+        else input = "";
+      } else input += c;
+    };
+    if (tcpClient && tcpClient.connected() && tcpClient.available())
+      readChar(tcpClient.read());
+    if (Serial.available())
+      readChar(Serial.read());
+    if (input == "\x01") return;
+  }
+}
+
+// ==================================================
+// GOAL REACHED HANDLER
+// ==================================================
+void onGoalReached() {
+  killMotors();
+
+  if (gExploring) {
+    // ── END OF PHASE 1 ──────────────────────────────
+    tcpPrintln("================================");
+    tcpPrintln(" GOAL REACHED  —  EXPLORATION   ");
+    tcpPrintln("================================");
+    printPath();
+    tcpPrintln("\nPlace robot back at START, then send 'run'.\n");
+
+    gExploring = false;
+    gPathIdx   = 0;
+
+    waitForCommand("[WAITING] Send 'run' to execute optimal path...", "run");
+    tcpPrintln("[REPLAY] Executing optimal path!");
+
+  } else {
+    // ── END OF PHASE 2 ──────────────────────────────
+    tcpPrintln("================================");
+    tcpPrintln("  OPTIMAL PATH COMPLETE!        ");
+    tcpPrintln("================================");
+    while (true) delay(1000);
+  }
+}
+
+// ==================================================
+// JUNCTION RESOLUTION
+// ──────────────────────────────────────────────────
+//  EXPLORE mode → LHR decision → recordTurn()
+//  REPLAY  mode → consume gPath[gPathIdx++]
+// ==================================================
+void resolveJunction(bool goL, bool goR) {
+  // Crawl to junction centre without stopping
+  driveFwd();
+  writePWM(SPD_CREEP, SPD_CREEP);
+  delay(T_CREEP_JCT);
+  killMotors();
+  delay(T_BRAKE);
+
+  char pick;
+
+  if (gExploring) {
+    // --- Phase 1: LHR + record ---
+    bool ja, jb, jc, jd, je;
+    snapshot(ja, jb, jc, jd, je);
+    tcpPrintf("[JCT] %s\n", mask(ja,jb,jc,jd,je).c_str());
+
+    goL      = goL || ja || jb;
+    bool goS = jc;
+    goR      = goR || jd || je;
+
+    if      (goL) pick = 'L';
+    else if (goS) pick = 'S';
+    else if (goR) pick = 'R';
+    else          pick = 'B';
+
+    recordTurn(pick);
+    tcpPrintf("[EXPLORE->%c] path so far (%d): ", pick, gPathLen);
+    for (int i = 0; i < gPathLen; i++) {
+      char cb[2] = {gPath[i], '\0'};
+      tcpPrint(cb);
+    }
+    tcpPrintln("");
+
+  } else {
+    // --- Phase 2: consume next recorded step ---
+    if (gPathIdx < gPathLen) {
+      pick = gPath[gPathIdx++];
+      tcpPrintf("[REPLAY->%c] step %d / %d\n", pick, gPathIdx, gPathLen);
+    } else {
+      tcpPrintln("[REPLAY] ERROR: path exhausted unexpectedly!");
+      killMotors();
+      while (true) delay(1000);
+    }
+  }
+
+  applyHeading(pick);
+  armLockout();
+}
+
+// ==================================================
+// WIFI + TCP INIT
+// ==================================================
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.config(localIP, gateway, subnet, dns);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500); Serial.print("."); tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi OK — IP: %s\n", WiFi.localIP().toString().c_str());
+    tcpServer.begin();
+    Serial.printf("TCP server on port %d\n", TCP_PORT);
+  } else {
+    Serial.println("\nWiFi FAILED — USB serial only");
+  }
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(MOTOR_ENABLE, OUTPUT);
+  pinMode(ML_FWD,OUTPUT); pinMode(ML_REV,OUTPUT);
+  pinMode(MR_FWD,OUTPUT); pinMode(MR_REV,OUTPUT);
+  pinMode(IR_A,INPUT); pinMode(IR_B,INPUT); pinMode(IR_C,INPUT);
+  pinMode(IR_D,INPUT); pinMode(IR_E,INPUT);
+
+  ledcSetup(CHAN_A, TICK_FREQ, TICK_BITS); ledcAttachPin(PWM_WHEEL_L, CHAN_A);
+  ledcSetup(CHAN_B, TICK_FREQ, TICK_BITS); ledcAttachPin(PWM_WHEEL_R, CHAN_B);
+
+  digitalWrite(MOTOR_ENABLE, HIGH);
+  killMotors();
+  initWiFi();
+
+  Serial.println("======================================");
+  Serial.println("  MAZE ROBOT v4.0 — EXPLORE + SOLVE   ");
+  Serial.println("  Phase 1: LHR exploration             ");
+  Serial.println("  Phase 2: Optimal path replay         ");
+  Serial.println("======================================");
+  delay(2000);
+
+  waitForCommand("[WAITING] Place at START then send 'start'...", "start");
+  tcpPrintln("[GO] Phase 1 — Exploring maze!");
+}
+
+// ==================================================
+// MAIN LOOP
+// ==================================================
+void loop() {
+  // Keep TCP client alive
+  if (!tcpClient || !tcpClient.connected()) {
+    tcpClient = tcpServer.available();
+    if (tcpClient) tcpPrintln("[TCP] Client reconnected");
+  }
+
+  bool a, b, c, d, e;
+  snapshot(a, b, c, d, e);
+  int hits = tally(a, b, c, d, e);
+
+  // ── Post-turn lockout: just keep following ──
+  if (millis() < gLockEnd) {
+    followLine(a, b, c, d, e);
+    return;
+  }
+
+  // ── 3+ sensors lit: junction or goal ──
+  if (hits >= 3) {
+
+    // Goal check first (4+ sensors)
+    if (hits >= 4) {
+      tcpPrintln("[GOAL?] 4+ sensors — creeping to confirm");
+      driveFwd(); writePWM(SPD_CREEP, SPD_CREEP);
+      delay(T_CREEP_JCT);
+      killMotors(); delay(T_BRAKE);
+
+      bool ga, gb, gc, gd, ge;
+      snapshot(ga, gb, gc, gd, ge);
+      int gHits = tally(ga, gb, gc, gd, ge);
+      tcpPrintf("[GOAL?] post-creep %s count=%d\n",
+                mask(ga,gb,gc,gd,ge).c_str(), gHits);
+
+      if (gHits >= 4) {
+        onGoalReached();
+        return;
+      }
+
+      // Not a goal — treat as junction with fresh read
+      bool sa, sb, sc, sd, se;
+      snapshot(sa, sb, sc, sd, se);
+      bool pathL = a||b||sa||sb;
+      bool pathR = d||e||sd||se;
+      tcpPrintf("[NOT GOAL] jct L=%d R=%d\n", pathL, pathR);
+      if (!pathL && !pathR) {
+        if (gExploring) recordTurn('B');
+        applyHeading('B'); armLockout();
+      } else {
+        resolveJunction(pathL, pathR);
+      }
+      return;
+    }
+
+    // Normal 3-sensor junction
+    bool pathL = a || b;
+    bool pathR = d || e;
+    tcpPrintf("[JCT] approach %s L=%d R=%d\n",
+              mask(a,b,c,d,e).c_str(), pathL, pathR);
+    if (!pathL && !pathR) {
+      if (gExploring) recordTurn('B');
+      applyHeading('B'); armLockout();
+      return;
+    }
+    resolveJunction(pathL, pathR);
+    return;
+  }
+
+  // ── Line lost ──
+  static bool          lostFlag = false;
+  static unsigned long lostAt   = 0;
+
+  if (!(a || b || c || d || e)) {
+    if (!lostFlag) { lostFlag = true; lostAt = millis(); }
+    if (millis() - lostAt >= T_LINELOST) {
+      killMotors(); delay(T_BRAKE);
+      lostFlag = false;
+
+      tcpPrintln("[PEEK] Line lost — creeping ahead");
+      driveFwd(); writePWM(SPD_CREEP, SPD_CREEP);
+      delay(T_CREEP_PEEK);
+      killMotors(); delay(T_BRAKE);
+
+      bool pa, pb, pc, pd, pe;
+      snapshot(pa, pb, pc, pd, pe);
+      int pHits = tally(pa, pb, pc, pd, pe);
+      tcpPrintf("[PEEK] %s\n", mask(pa,pb,pc,pd,pe).c_str());
+
+      if (pHits >= 3 && (pa || pb || pd || pe)) {
+        resolveJunction(pa || pb, pd || pe);
+      } else {
+        if (gExploring) recordTurn('B');
+        applyHeading('B'); armLockout();
+      }
+    }
+    return;
+  } else {
+    lostFlag = false;
+  }
+
+  // ── Normal line follow ──
+  followLine(a, b, c, d, e);
+}
