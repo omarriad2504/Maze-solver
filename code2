@@ -1,0 +1,778 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ── BLE UUIDS (must match web app) ──
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CMD_CHAR_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define LOG_CHAR_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define SENSOR_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26aa"
+#define STATUS_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26ab"
+
+// ── BLE OBJECTS ──
+BLEServer*         pServer = nullptr;
+BLECharacteristic* pCmdChar = nullptr;
+BLECharacteristic* pLogChar = nullptr;
+BLECharacteristic* pSensorChar = nullptr;
+BLECharacteristic* pStatusChar = nullptr;
+bool bleConnected = false;
+bool oldConnected = false;
+
+// ── MOTOR DRIVER PINS ──
+#define MOTOR_ENABLE  13
+#define PWM_WHEEL_L   26
+#define PWM_WHEEL_R   32
+#define ML_FWD        27
+#define ML_REV        14
+#define MR_FWD        33
+#define MR_REV        25
+
+// ── IR SENSOR INPUTS ──
+#define IR_A  23
+#define IR_B  22
+#define IR_C  21
+#define IR_D  19
+#define IR_E  18
+
+// ── PWM CONFIG ──
+#define TICK_FREQ 1000
+#define TICK_BITS 8
+
+// ==================================================
+// SPEED CONSTANTS
+// ==================================================
+const int SPD_BASE    = 140;
+const int SPD_BOTTOM  = 85;
+const int SPD_TOP     = 205;
+const int SPD_ROTATE  = 130;
+int       manualSpeed = 120;
+
+// ==================================================
+// CORRECTION STEPS
+// ==================================================
+const int STEP_1 = 70;
+const int STEP_2 = 75;
+const int STEP_3 = 80;
+const int STEP_4 = 85;
+
+// ==================================================
+// TIMING CONSTANTS
+// ==================================================
+const unsigned long T_BRAKE      = 35;
+const unsigned long T_SETTLE     = 600;
+const unsigned long T_CREEP_JCT  = 510;
+const unsigned long T_CREEP_PEEK = 150;
+const unsigned long T_SPIN_MIN   = 500;
+const unsigned long T_SCAN_MAX   = 1700;
+const unsigned long T_CONFIRM    = 45;
+const unsigned long T_LINELOST   = 220;
+const unsigned long T_GOALCHECK  = 250;
+const unsigned long T_LOCKOUT    = 220;
+
+// ==================================================
+// STATE
+// ==================================================
+int           gLastErr = 0;
+unsigned long gLockEnd = 0;
+bool          goalReached = false;
+int robotMode = 1; // 1=waitStart 2=training 3=waitBack 4=solving 5=done
+
+volatile bool  cmdReady = false;
+char           cmdBuf[64] = {0};
+
+// ==================================================
+// PATH MEMORY
+// ==================================================
+#define MAX_PATH 500
+char mazePath[MAX_PATH];
+int pathLength = 0;
+char simplifiedPath[MAX_PATH];
+int simplifiedLen = 0;
+char returnPath[MAX_PATH];
+int returnLen = 0;
+
+// ==================================================
+// BLE CALLBACKS
+// ==================================================
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* s)    { bleConnected = true;  }
+  void onDisconnect(BLEServer* s) { bleConnected = false; }
+};
+
+class CmdCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) {
+    String val = c->getValue();
+    if (val.length() > 0 && val.length() < 63) {
+      strncpy(cmdBuf, val.c_str(), 63);
+      cmdBuf[63] = '\0';
+      cmdReady = true;
+    }
+  }
+};
+
+// ==================================================
+// BLE SEND HELPERS
+// ==================================================
+void bleSendLog(const char* msg) {
+  Serial.println(msg);
+  if (!bleConnected || !pLogChar) return;
+  int len = strlen(msg);
+  int pos = 0;
+  while (pos < len) {
+    int chunk = min(len - pos, 19);
+    pLogChar->setValue((uint8_t*)(msg + pos), chunk);
+    pLogChar->notify();
+    pos += chunk;
+    if (pos < len) delay(15);
+  }
+}
+
+void bleSendLogf(const char* fmt, ...) {
+  char buf[200];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  bleSendLog(buf);
+}
+
+void bleSendSensors(bool a, bool b, bool c, bool d, bool e) {
+  if (!bleConnected || !pSensorChar) return;
+  char s[6];
+  s[0]=a?'1':'0'; s[1]=b?'1':'0'; s[2]=c?'1':'0';
+  s[3]=d?'1':'0'; s[4]=e?'1':'0'; s[5]='\0';
+  pSensorChar->setValue((uint8_t*)s, 5);
+  pSensorChar->notify();
+}
+
+void bleSendStatus(const char* status) {
+  Serial.printf("[STATUS] %s\n", status);
+  if (!bleConnected || !pStatusChar) return;
+  pStatusChar->setValue((uint8_t*)status, strlen(status));
+  pStatusChar->notify();
+}
+
+unsigned long lastSensorBroadcast = 0;
+
+// ==================================================
+// PATH RECORDING
+// ==================================================
+void recordPath(char dir) {
+  if (pathLength < MAX_PATH - 1) {
+    mazePath[pathLength] = dir;
+    pathLength++;
+    mazePath[pathLength] = '\0';
+    bleSendLogf(">>> PATH RECORDED: %s", mazePath);
+  }
+}
+
+// ==================================================
+// PATH SIMPLIFICATION
+// ==================================================
+char resolveXBY(char x, char y) {
+  auto toAngle = [](char c) -> int {
+    if (c == 'L') return -90;
+    if (c == 'R') return 90;
+    if (c == 'S') return 0;
+    if (c == 'B') return 180;
+    return 0;
+  };
+  int total = toAngle(x) + 180 + toAngle(y);
+  total = ((total % 360) + 360) % 360;
+  if (total == 0)   return 'S';
+  if (total == 90)  return 'R';
+  if (total == 180) return 'B';
+  if (total == 270) return 'L';
+  return 'S';
+}
+
+void simplifyPath() {
+  memcpy(simplifiedPath, mazePath, pathLength + 1);
+  simplifiedLen = pathLength;
+  bleSendLogf("Raw path: %s (%d)", simplifiedPath, simplifiedLen);
+  bool changed = true;
+  int pass = 0;
+  while (changed) {
+    changed = false;
+    pass++;
+    for (int i = 0; i < simplifiedLen; i++) {
+      if (simplifiedPath[i] == 'B' && i > 0 && i < simplifiedLen - 1) {
+        char x = simplifiedPath[i - 1];
+        char y = simplifiedPath[i + 1];
+        char rep = resolveXBY(x, y);
+        bleSendLogf("Pass %d: %c%c%c -> %c", pass, x, 'B', y, rep);
+        simplifiedPath[i - 1] = rep;
+        for (int j = i; j < simplifiedLen - 2; j++)
+          simplifiedPath[j] = simplifiedPath[j + 2];
+        simplifiedLen -= 2;
+        simplifiedPath[simplifiedLen] = '\0';
+        changed = true;
+        break;
+      }
+    }
+  }
+  bleSendLogf("Simplified: %s (%d)", simplifiedPath, simplifiedLen);
+}
+
+void buildReturnPath() {
+  returnLen = simplifiedLen;
+  for (int i = 0; i < simplifiedLen; i++) {
+    char c = simplifiedPath[simplifiedLen - 1 - i];
+    if (c == 'L')      returnPath[i] = 'R';
+    else if (c == 'R') returnPath[i] = 'L';
+    else               returnPath[i] = c;
+  }
+  returnPath[returnLen] = '\0';
+  bleSendLogf("Return path: %s", returnPath);
+}
+
+// ==================================================
+// MOTOR HELPERS
+// ==================================================
+void whl_L_fwd() { digitalWrite(ML_FWD, LOW);  digitalWrite(ML_REV, HIGH); }
+void whl_L_rev() { digitalWrite(ML_FWD, HIGH); digitalWrite(ML_REV, LOW);  }
+void whl_R_fwd() { digitalWrite(MR_FWD, LOW);  digitalWrite(MR_REV, HIGH); }
+void whl_R_rev() { digitalWrite(MR_FWD, HIGH); digitalWrite(MR_REV, LOW);  }
+
+void driveFwd() { whl_L_fwd(); whl_R_fwd(); }
+void pivotCCW() { whl_L_rev(); whl_R_fwd(); }
+void pivotCW()  { whl_L_fwd(); whl_R_rev(); }
+
+void killMotors() {
+  ledcWrite(PWM_WHEEL_L, 0);
+  ledcWrite(PWM_WHEEL_R, 0);
+}
+
+void writePWM(int vL, int vR) {
+  ledcWrite(PWM_WHEEL_L, (uint8_t)constrain(vL, 0, 255));
+  ledcWrite(PWM_WHEEL_R, (uint8_t)constrain(vR, 0, 255));
+}
+
+// ==================================================
+// SENSOR READING
+// ==================================================
+bool pollPin(int p) {
+  int n = 0;
+  for (int k = 0; k < 3; k++) {
+    if (digitalRead(p) == LOW) n++;
+    delayMicroseconds(150);
+  }
+  return n >= 2;
+}
+
+void snapshot(bool &a, bool &b, bool &c, bool &d, bool &e) {
+  a = pollPin(IR_A); b = pollPin(IR_B); c = pollPin(IR_C);
+  d = pollPin(IR_D); e = pollPin(IR_E);
+}
+
+int tally(bool a, bool b, bool c, bool d, bool e) {
+  return (int)a + (int)b + (int)c + (int)d + (int)e;
+}
+
+String mask(bool a, bool b, bool c, bool d, bool e) {
+  String s = "";
+  s += a?'1':'0'; s += b?'1':'0'; s += c?'1':'0';
+  s += d?'1':'0'; s += e?'1':'0';
+  return s;
+}
+
+bool lineUnderCenter() {
+  bool a, b, c, d, e;
+  snapshot(a, b, c, d, e);
+  return c || (b && d);
+}
+
+// ==================================================
+// LINE REACQUISITION
+// ==================================================
+bool spinUntilLine(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (lineUnderCenter()) {
+      unsigned long th = millis();
+      while (millis() - th < T_CONFIRM) {
+        if (!lineUnderCenter()) th = millis();
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+void armLockout() { gLockEnd = millis() + T_LOCKOUT; }
+
+// ==================================================
+// LINE FOLLOWING
+// ==================================================
+void followLine(bool a, bool b, bool c, bool d, bool e) {
+  driveFwd();
+  const int wt[5] = {-2, -1, 0, 1, 2};
+  bool ir[5] = {a, b, c, d, e};
+  int num = 0, den = 0;
+  for (int i = 0; i < 5; i++) { if (ir[i]) { num += wt[i]; den++; } }
+  int err;
+  if (den > 0) { err = num; gLastErr = err; }
+  else { err = (gLastErr < 0) ? -4 : (gLastErr > 0) ? 4 : 0; }
+  int ea = abs(err), adj;
+  if      (ea == 0) adj = 0;
+  else if (ea == 1) adj = STEP_1;
+  else if (ea == 2) adj = STEP_2;
+  else if (ea == 3) adj = STEP_3;
+  else              adj = STEP_4;
+  if (err < 0) adj = -adj;
+  writePWM(constrain(SPD_BASE + adj, SPD_BOTTOM, SPD_TOP),
+           constrain(SPD_BASE - adj, SPD_BOTTOM, SPD_TOP));
+}
+
+// ==================================================
+// HEADING CHANGE + PATH RECORD (training)
+// ==================================================
+bool applyHeading(char h) {
+  if (h == 'S') { recordPath('S'); return true; }
+  bool ok = false;
+  if (h == 'L') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[TURN] LEFT OK" : "[TURN] LEFT FAIL");
+    if (ok) recordPath('L');
+    return ok;
+  }
+  if (h == 'R') {
+    pivotCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[TURN] RIGHT OK" : "[TURN] RIGHT FAIL");
+    if (ok) recordPath('R');
+    return ok;
+  }
+  if (h == 'B') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN * 2);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[TURN] U-TURN OK" : "[TURN] U-TURN FAIL");
+    if (ok) recordPath('B');
+    return ok;
+  }
+  return false;
+}
+
+// ==================================================
+// EXECUTE HEADING (no recording — solving run)
+// ==================================================
+bool execHeading(char h) {
+  if (h == 'S') return true;
+  bool ok = false;
+  if (h == 'L') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[RUN2] LEFT OK" : "[RUN2] LEFT FAIL");
+    return ok;
+  }
+  if (h == 'R') {
+    pivotCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[RUN2] RIGHT OK" : "[RUN2] RIGHT FAIL");
+    return ok;
+  }
+  if (h == 'B') {
+    pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE); delay(T_SPIN_MIN * 2);
+    ok = spinUntilLine(T_SCAN_MAX);
+    killMotors(); delay(T_BRAKE);
+    bleSendLog(ok ? "[RUN2] U-TURN OK" : "[RUN2] U-TURN FAIL");
+    return ok;
+  }
+  return false;
+}
+
+// ==================================================
+// JUNCTION RESOLUTION
+// FIX v4.1: goS = S2 || S3 || S4 (wider straight)
+// After creep the car is past the junction. Any middle
+// sensor seeing black = forward line exists. If car
+// entered at angle, S2 or S4 catches what S3 missed.
+// ==================================================
+void resolveJunction(bool goL, bool goR) {
+  bleSendLogf("[JCT] pre-creep L=%d R=%d", goL, goR);
+  driveFwd(); writePWM(SPD_BASE, SPD_BASE);
+  delay(T_CREEP_JCT);
+  killMotors(); delay(T_BRAKE);
+
+  bool ja, jb, jc, jd, je;
+  snapshot(ja, jb, jc, jd, je);
+  bleSendLogf("[JCT] post-creep %s", mask(ja,jb,jc,jd,je).c_str());
+
+  goL = goL || ja || jb;
+  bool goS = jb || jc || jd;  // FIX: wider straight detect
+  goR = goR || jd || je;
+
+  bleSendLogf("[DECISION] L=%d S=%d R=%d", goL, goS, goR);
+
+  char pick;
+  if      (goL) pick = 'L';
+  else if (goS) pick = 'S';
+  else if (goR) pick = 'R';
+  else          pick = 'B';
+
+  bleSendLogf("[CHOSEN] -> %c", pick);
+  applyHeading(pick);
+  armLockout();
+}
+
+// ==================================================
+// EXECUTE RETURN PATH
+// ==================================================
+void executeReturnPath() {
+  bleSendStatus("solving");
+  bleSendLogf("Return path: %s (%d moves)", returnPath, returnLen);
+  bleSendLog("Turning 180...");
+
+  pivotCCW(); writePWM(SPD_ROTATE, SPD_ROTATE);
+  delay(T_SPIN_MIN * 2);
+  bool ok = spinUntilLine(T_SCAN_MAX);
+  killMotors(); delay(T_BRAKE);
+  bleSendLog(ok ? "[180] OK" : "[180] FAIL");
+
+  if (!ok) { bleSendLog("[ABORT]"); robotMode = 5; bleSendStatus("done"); return; }
+
+  int moveIndex = 0;
+  gLastErr = 0;
+  armLockout();
+
+  while (moveIndex < returnLen) {
+    if (cmdReady) {
+      String c = String(cmdBuf); cmdReady = false;
+      if (c == "stop") {
+        killMotors(); bleSendLog("[ESTOP] during solving");
+        robotMode = 5; bleSendStatus("stopped"); return;
+      }
+    }
+
+    bool a, b, c, d, e;
+    snapshot(a, b, c, d, e);
+    int hits = tally(a, b, c, d, e);
+
+    if (millis() - lastSensorBroadcast > 100) {
+      bleSendSensors(a, b, c, d, e);
+      lastSensorBroadcast = millis();
+    }
+
+    if (millis() < gLockEnd) { followLine(a, b, c, d, e); continue; }
+
+    bool edgeActive = a || e;
+    if (hits >= 3 && edgeActive) {
+      bleSendLogf("[RUN2-JCT] %s move %d/%d=%c",
+                  mask(a,b,c,d,e).c_str(), moveIndex+1, returnLen, returnPath[moveIndex]);
+      killMotors(); delay(T_SETTLE);
+      driveFwd(); writePWM(SPD_BASE, SPD_BASE);
+      delay(T_CREEP_JCT);
+      killMotors(); delay(T_BRAKE);
+      execHeading(returnPath[moveIndex]);
+      moveIndex++;
+      armLockout();
+      continue;
+    }
+
+    bool anySeen = a || b || c || d || e;
+    if (!anySeen) {
+      if (gLastErr <= 0) pivotCCW(); else pivotCW();
+      writePWM(SPD_ROTATE, SPD_ROTATE);
+      delay(50);
+      continue;
+    }
+
+    followLine(a, b, c, d, e);
+  }
+
+  bleSendLog("[RUN2] Looking for start marker...");
+  unsigned long endSearch = millis();
+  while (millis() - endSearch < 10000) {
+    bool a, b, c, d, e;
+    snapshot(a, b, c, d, e);
+    int hits = tally(a, b, c, d, e);
+    if (hits >= 4) {
+      killMotors();
+      bleSendLog("RETURNED TO START");
+      robotMode = 5; bleSendStatus("done"); return;
+    }
+    if (millis() < gLockEnd) { followLine(a, b, c, d, e); }
+    else {
+      bool edge = a || e;
+      if (hits >= 3 && edge) {
+        driveFwd(); writePWM(SPD_BASE, SPD_BASE);
+        delay(T_CREEP_JCT); armLockout();
+      } else { followLine(a, b, c, d, e); }
+    }
+  }
+  killMotors();
+  bleSendLog("[RUN2] Timeout");
+  robotMode = 5; bleSendStatus("done");
+}
+
+// ==================================================
+// PROCESS BLE COMMAND
+// ==================================================
+void processCommand(const char* cmd) {
+  String c = String(cmd);
+  c.trim(); c.toLowerCase();
+  Serial.printf("[CMD] Received: %s\n", c.c_str());
+
+  if (c == "stop") {
+    killMotors(); robotMode = 5;
+    bleSendLog("[ESTOP] Motors killed");
+    bleSendStatus("stopped"); return;
+  }
+  if (c.startsWith("spd:")) {
+    manualSpeed = constrain(c.substring(4).toInt(), 60, 200); return;
+  }
+  if (c == "fwd")   { driveFwd(); writePWM(manualSpeed, manualSpeed); return; }
+  if (c == "rev")   { whl_L_rev(); whl_R_rev(); writePWM(manualSpeed, manualSpeed); return; }
+  if (c == "left")  { pivotCCW(); writePWM(manualSpeed, manualSpeed); return; }
+  if (c == "right") { pivotCW();  writePWM(manualSpeed, manualSpeed); return; }
+  if (c == "mstop") { killMotors(); return; }
+
+  if (c == "start" && (robotMode == 1 || robotMode == 5)) {
+    bleSendLog("[START] Training in 3...");
+    delay(1000); bleSendLog("[START] 2...");
+    delay(1000); bleSendLog("[START] 1...");
+    delay(1000); bleSendLog("[START] GO!");
+    memset(mazePath, 0, sizeof(mazePath));
+    pathLength = 0; goalReached = false; gLastErr = 0;
+    robotMode = 2; bleSendStatus("training"); return;
+  }
+  if (c == "back" && robotMode == 3) {
+    bleSendLog("[BACK] Solving in 3...");
+    delay(1000); bleSendLog("[BACK] 2...");
+    delay(1000); bleSendLog("[BACK] 1...");
+    delay(1000); bleSendLog("[BACK] GO!");
+    robotMode = 4; executeReturnPath(); return;
+  }
+}
+
+// ==================================================
+// BLE INIT
+// ==================================================
+void initBLE() {
+  BLEDevice::init("MazeRobot");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  pCmdChar = pService->createCharacteristic(
+    CMD_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  pCmdChar->setCallbacks(new CmdCallbacks());
+
+  pLogChar = pService->createCharacteristic(
+    LOG_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pLogChar->addDescriptor(new BLE2902());
+
+  pSensorChar = pService->createCharacteristic(
+    SENSOR_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pSensorChar->addDescriptor(new BLE2902());
+
+  pStatusChar = pService->createCharacteristic(
+    STATUS_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pStatusChar->addDescriptor(new BLE2902());
+
+  pService->start();
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+  Serial.println("[BLE] Advertising as 'MazeRobot'");
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(MOTOR_ENABLE, OUTPUT);
+  pinMode(ML_FWD, OUTPUT); pinMode(ML_REV, OUTPUT);
+  pinMode(MR_FWD, OUTPUT); pinMode(MR_REV, OUTPUT);
+  pinMode(IR_A, INPUT); pinMode(IR_B, INPUT); pinMode(IR_C, INPUT);
+  pinMode(IR_D, INPUT); pinMode(IR_E, INPUT);
+
+  ledcAttach(PWM_WHEEL_L, TICK_FREQ, TICK_BITS);
+  ledcAttach(PWM_WHEEL_R, TICK_FREQ, TICK_BITS);
+
+  digitalWrite(MOTOR_ENABLE, HIGH);
+  killMotors();
+  memset(mazePath, 0, sizeof(mazePath));
+  pathLength = 0;
+
+  initBLE();
+
+  Serial.println("==========================================");
+  Serial.println("  MAZE ROBOT v4.1 — BLE + LHR + SIMPLIFY");
+  Serial.println("  FIX: wider straight detect (S2|S3|S4)");
+  Serial.println("  2x TB6612FNG | 4x 25GA370");
+  Serial.println("  BLE GATT: 'MazeRobot'");
+  Serial.println("==========================================");
+
+  robotMode = 1;
+}
+
+// ==================================================
+// MAIN LOOP
+// ==================================================
+void loop() {
+  if (!bleConnected && oldConnected) {
+    delay(500); BLEDevice::startAdvertising();
+    Serial.println("[BLE] Disconnected — re-advertising");
+    oldConnected = false;
+  }
+  if (bleConnected && !oldConnected) {
+    Serial.println("[BLE] Client connected");
+    oldConnected = true;
+    bleSendStatus("idle");
+  }
+
+  if (cmdReady) { processCommand(cmdBuf); cmdReady = false; }
+
+  // ── IDLE MODES ──
+  if (robotMode == 1 || robotMode == 3 || robotMode == 5) {
+    if (millis() - lastSensorBroadcast > 200) {
+      bool a, b, c, d, e;
+      snapshot(a, b, c, d, e);
+      bleSendSensors(a, b, c, d, e);
+      lastSensorBroadcast = millis();
+    }
+    return;
+  }
+
+  // ── TRAINING (LHR) ──
+  if (robotMode == 2) {
+    bool a, b, c, d, e;
+    snapshot(a, b, c, d, e);
+    int hits = tally(a, b, c, d, e);
+
+    if (millis() - lastSensorBroadcast > 100) {
+      bleSendSensors(a, b, c, d, e);
+      lastSensorBroadcast = millis();
+    }
+
+    if (millis() < gLockEnd) { followLine(a, b, c, d, e); return; }
+
+    // Junction: 3+ sensors + edge
+    bool edgeActive = a || e;
+    if (hits >= 3 && edgeActive) {
+      bleSendLogf("[ENTRY] %s hits=%d", mask(a,b,c,d,e).c_str(), hits);
+      killMotors();
+      delay(T_SETTLE);
+
+      bool sa, sb, sc, sd, se;
+      snapshot(sa, sb, sc, sd, se);
+      int sHits = tally(sa, sb, sc, sd, se);
+      bleSendLogf("[SETTLE] %s count=%d", mask(sa,sb,sc,sd,se).c_str(), sHits);
+
+      bool pathL = sa || sb;
+      bool pathR = sd || se;
+      bleSendLogf("[LOCKED-LR] L=%d R=%d", pathL, pathR);
+
+      // Goal check
+      if (sHits >= 4) {
+        bleSendLog("[GOAL?] 4+ sensors — creeping");
+        driveFwd(); writePWM(SPD_BASE, SPD_BASE);
+        delay(T_CREEP_JCT);
+        killMotors(); delay(T_BRAKE);
+
+        bool ga, gb, gc, gd, ge;
+        snapshot(ga, gb, gc, gd, ge);
+        int gHits = tally(ga, gb, gc, gd, ge);
+        bleSendLogf("[GOAL?] post-creep %s count=%d", mask(ga,gb,gc,gd,ge).c_str(), gHits);
+
+        if (gHits >= 4) {
+          killMotors();
+          goalReached = true;
+          bleSendLog("GOAL REACHED — RUN 1 DONE");
+          bleSendLogf("Raw path: %s", mazePath);
+          bleSendStatus("goal");
+          simplifyPath();
+          buildReturnPath();
+          robotMode = 3;
+          bleSendStatus("idle");
+          bleSendLog(">> Type 'back' to solve");
+          return;
+        }
+
+        // Not goal — FIX v4.1: wider straight check
+        bool goS = gb || gc || gd;
+        pathL = pathL || ga || gb;
+        pathR = pathR || gd || ge;
+        bleSendLogf("[POST-GOAL] L=%d S=%d R=%d", pathL, goS, pathR);
+
+        char pick;
+        if      (pathL) pick = 'L';
+        else if (goS)   pick = 'S';
+        else if (pathR) pick = 'R';
+        else            pick = 'B';
+
+        bleSendLogf("[CHOSEN] -> %c", pick);
+        applyHeading(pick);
+        armLockout();
+        return;
+      }
+
+      // Normal junction
+      bleSendLogf("[CLASSIFY] L=%d R=%d", pathL, pathR);
+      if (!pathL && !pathR) {
+        bleSendLog("[DEAD END] U-turn");
+        applyHeading('B');
+        return;
+      }
+      resolveJunction(pathL, pathR);
+      return;
+    }
+
+    // Line lost
+    static bool lostFlag = false;
+    static unsigned long lostAt = 0;
+    bool anySeen = a || b || c || d || e;
+
+    if (!anySeen) {
+      if (!lostFlag) { lostFlag = true; lostAt = millis(); }
+      if (millis() - lostAt >= T_LINELOST) {
+        killMotors(); delay(T_BRAKE);
+        lostFlag = false;
+        bleSendLog("[PEEK] Lost line");
+        driveFwd(); writePWM(SPD_BASE, SPD_BASE);
+        delay(T_CREEP_PEEK);
+        killMotors(); delay(T_BRAKE);
+
+        bool pa, pb, pc, pd, pe;
+        snapshot(pa, pb, pc, pd, pe);
+        int pHits = tally(pa, pb, pc, pd, pe);
+        bleSendLogf("[PEEK] %s", mask(pa,pb,pc,pd,pe).c_str());
+
+        if (pHits >= 3) {
+          bool pL = pa || pb;
+          bool pR = pd || pe;
+          if (pL || pR) { resolveJunction(pL, pR); }
+          else { bleSendLog("[DEAD END] U-turn"); applyHeading('B'); armLockout(); }
+        } else {
+          bleSendLog("[DEAD END] U-turn");
+          applyHeading('B'); armLockout();
+        }
+      }
+      return;
+    } else { lostFlag = false; }
+
+    followLine(a, b, c, d, e);
+    return;
+  }
+}
