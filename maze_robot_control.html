@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maze Robot Control</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--bg2:#12121a;--bg3:#1a1a26;--bg4:#22222f;
+  --tx:#e8e6e0;--tx2:#9c9a92;--tx3:#6a685f;
+  --acc:#3dd68c;--acc2:#2bb574;--acc-glow:rgba(61,214,140,0.15);
+  --red:#f05555;--amber:#f0a030;--blue:#4da6ff;--purple:#a07df0;
+  --border:#2a2a38;--radius:12px;
+  --font:'Outfit',sans-serif;--mono:'JetBrains Mono',monospace;
+}
+body{font-family:var(--font);background:var(--bg);color:var(--tx);min-height:100vh;overflow-x:hidden}
+button{font-family:var(--font);cursor:pointer;border:none;outline:none}
+input{font-family:var(--font)}
+
+.app{max-width:1100px;margin:0 auto;padding:20px}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:24px}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:36px;height:36px;background:var(--acc);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:var(--bg)}
+.logo h1{font-size:20px;font-weight:600;letter-spacing:-0.5px}
+.logo span{color:var(--tx3);font-weight:300;font-size:14px;margin-left:8px}
+.conn-area{display:flex;align-items:center;gap:12px}
+.conn-dot{width:10px;height:10px;border-radius:50%;background:var(--red);transition:all 0.3s}
+.conn-dot.on{background:var(--acc);box-shadow:0 0 12px var(--acc)}
+.conn-label{font-size:13px;color:var(--tx2);font-family:var(--mono)}
+.btn-connect{padding:8px 20px;border-radius:8px;font-size:13px;font-weight:500;background:var(--acc);color:var(--bg);transition:all 0.2s}
+.btn-connect:hover{transform:translateY(-1px);box-shadow:0 4px 16px var(--acc-glow)}
+.btn-connect.connected{background:var(--bg3);color:var(--red);border:1px solid var(--red)}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-bottom:24px;background:var(--bg2);border-radius:10px;padding:4px;border:1px solid var(--border)}
+.tab{flex:1;padding:10px;text-align:center;border-radius:8px;font-size:14px;font-weight:500;color:var(--tx3);transition:all 0.2s;background:transparent}
+.tab:hover{color:var(--tx2)}
+.tab.active{background:var(--bg4);color:var(--acc);box-shadow:0 2px 8px rgba(0,0,0,0.3)}
+
+/* Panels */
+.panel{display:none}
+.panel.active{display:block;animation:fadeIn 0.3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* Cards */
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.card-title{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--tx3);margin-bottom:16px}
+
+/* Dashboard */
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:700px){.dash-grid{grid-template-columns:1fr}}
+
+.status-bar{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg3);border-radius:8px;margin-bottom:8px}
+.status-bar .label{font-size:12px;color:var(--tx3);min-width:60px}
+.status-bar .value{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--acc)}
+.status-bar .value.idle{color:var(--tx3)}
+.status-bar .value.training{color:var(--amber)}
+.status-bar .value.solving{color:var(--blue)}
+
+/* Sensors */
+.sensor-row{display:flex;gap:8px;justify-content:center;margin:16px 0}
+.sensor{width:56px;height:56px;border-radius:10px;background:var(--bg3);border:2px solid var(--border);display:flex;flex-direction:column;align-items:center;justify-content:center;transition:all 0.15s}
+.sensor.on{background:#1a2e20;border-color:var(--acc);box-shadow:0 0 16px var(--acc-glow)}
+.sensor .s-label{font-size:10px;color:var(--tx3);font-weight:600;margin-bottom:2px}
+.sensor .s-dot{width:12px;height:12px;border-radius:50%;background:var(--bg4);transition:all 0.15s}
+.sensor.on .s-dot{background:var(--acc);box-shadow:0 0 8px var(--acc)}
+.sensor.on .s-label{color:var(--acc)}
+
+/* Action buttons */
+.action-row{display:flex;gap:10px;margin-top:16px}
+.btn-action{flex:1;padding:14px;border-radius:10px;font-size:14px;font-weight:600;text-transform:uppercase;letter-spacing:1px;transition:all 0.2s}
+.btn-start{background:linear-gradient(135deg,#2bb574,#3dd68c);color:var(--bg)}
+.btn-start:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(61,214,140,0.3)}
+.btn-back{background:linear-gradient(135deg,#4080cc,#4da6ff);color:var(--bg)}
+.btn-back:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(77,166,255,0.3)}
+.btn-stop{background:linear-gradient(135deg,#d04040,#f05555);color:white}
+.btn-stop:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(240,85,85,0.3)}
+.btn-action:disabled{opacity:0.3;pointer-events:none;transform:none}
+
+/* Path display */
+.path-display{font-family:var(--mono);font-size:16px;letter-spacing:3px;padding:12px;background:var(--bg3);border-radius:8px;word-break:break-all;min-height:44px;color:var(--acc)}
+.path-display.simplified{color:var(--blue)}
+.path-display.return{color:var(--purple)}
+.path-label{font-size:11px;color:var(--tx3);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:1px}
+
+/* Manual Control */
+.dpad{display:grid;grid-template-columns:80px 80px 80px;grid-template-rows:80px 80px 80px;gap:6px;justify-content:center;margin:20px 0}
+.dpad-btn{border-radius:12px;background:var(--bg3);border:1px solid var(--border);color:var(--tx);font-size:20px;font-weight:600;display:flex;align-items:center;justify-content:center;transition:all 0.15s;user-select:none;-webkit-user-select:none}
+.dpad-btn:active,.dpad-btn.pressed{background:var(--acc);color:var(--bg);border-color:var(--acc);box-shadow:0 0 20px var(--acc-glow)}
+.dpad-btn.empty{background:transparent;border:none;pointer-events:none}
+.dpad-center{background:var(--bg4);border-radius:50%;font-size:12px;font-weight:500;color:var(--red)}
+.dpad-center:active{background:var(--red);color:white}
+
+.speed-control{display:flex;align-items:center;gap:16px;margin-top:20px;padding:16px;background:var(--bg3);border-radius:10px}
+.speed-control label{font-size:13px;color:var(--tx3);min-width:50px}
+.speed-control input[type=range]{flex:1;accent-color:var(--acc);height:6px}
+.speed-val{font-family:var(--mono);font-size:14px;color:var(--acc);min-width:40px;text-align:right}
+
+.manual-note{font-size:12px;color:var(--tx3);text-align:center;margin-top:12px}
+
+/* Logs */
+.log-container{background:var(--bg);border:1px solid var(--border);border-radius:8px;height:500px;overflow-y:auto;padding:12px;font-family:var(--mono);font-size:12px;line-height:1.8;scroll-behavior:smooth}
+.log-line{padding:2px 0;border-bottom:1px solid rgba(42,42,56,0.4)}
+.log-line .ts{color:var(--tx3);margin-right:8px}
+.log-line .msg{color:var(--tx2)}
+.log-line .msg.jct{color:var(--amber)}
+.log-line .msg.turn{color:var(--blue)}
+.log-line .msg.goal{color:var(--acc);font-weight:600}
+.log-line .msg.err{color:var(--red)}
+.log-line .msg.path{color:var(--purple)}
+.log-toolbar{display:flex;gap:8px;margin-bottom:8px}
+.btn-log{padding:6px 14px;border-radius:6px;font-size:12px;background:var(--bg3);color:var(--tx3);border:1px solid var(--border)}
+.btn-log:hover{color:var(--tx);border-color:var(--tx3)}
+.log-count{font-size:12px;color:var(--tx3);margin-left:auto;font-family:var(--mono)}
+
+/* Footer */
+.footer{text-align:center;padding:20px;color:var(--tx3);font-size:12px;border-top:1px solid var(--border);margin-top:24px}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">M</div>
+      <h1>Maze Robot <span>v3.1 BLE</span></h1>
+    </div>
+    <div class="conn-area">
+      <div class="conn-dot" id="connDot"></div>
+      <span class="conn-label" id="connLabel">Disconnected</span>
+      <button class="btn-connect" id="btnConnect" onclick="toggleConnection()">Connect</button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('dashboard',this)">Dashboard</button>
+    <button class="tab" onclick="switchTab('manual',this)">Manual control</button>
+    <button class="tab" onclick="switchTab('logs',this)">Logs</button>
+  </div>
+
+  <!-- Dashboard Panel -->
+  <div class="panel active" id="dashboard">
+    <div class="dash-grid">
+
+      <!-- Left column -->
+      <div>
+        <div class="card">
+          <div class="card-title">Robot status</div>
+          <div class="status-bar">
+            <span class="label">Stage</span>
+            <span class="value idle" id="stageVal">Idle</span>
+          </div>
+          <div class="status-bar">
+            <span class="label">Mode</span>
+            <span class="value" id="modeVal" style="color:var(--tx3)">—</span>
+          </div>
+          <div class="status-bar">
+            <span class="label">Junctions</span>
+            <span class="value" id="jctCount" style="color:var(--amber)">0</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Sensors (live)</div>
+          <div class="sensor-row">
+            <div class="sensor" id="sA"><span class="s-label">S1</span><span class="s-dot"></span></div>
+            <div class="sensor" id="sB"><span class="s-label">S2</span><span class="s-dot"></span></div>
+            <div class="sensor" id="sC"><span class="s-label">S3</span><span class="s-dot"></span></div>
+            <div class="sensor" id="sD"><span class="s-label">S4</span><span class="s-dot"></span></div>
+            <div class="sensor" id="sE"><span class="s-label">S5</span><span class="s-dot"></span></div>
+          </div>
+          <div style="text-align:center;font-size:11px;color:var(--tx3);margin-top:4px">
+            Far left ← → Far right
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Commands</div>
+          <div class="action-row">
+            <button class="btn-action btn-start" id="btnStart" onclick="sendCmd('start')" disabled>Start</button>
+            <button class="btn-action btn-back" id="btnBack" onclick="sendCmd('back')" disabled>Back</button>
+          </div>
+          <div class="action-row">
+            <button class="btn-action btn-stop" id="btnStop" onclick="sendCmd('stop')" disabled>E-Stop</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div>
+        <div class="card">
+          <div class="card-title">Path — raw (training)</div>
+          <div class="path-display" id="rawPath">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Path — simplified</div>
+          <div class="path-display simplified" id="simpPath">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Path — return (goal→start)</div>
+          <div class="path-display return" id="retPath">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Recent log</div>
+          <div id="miniLog" style="font-family:var(--mono);font-size:11px;color:var(--tx3);max-height:160px;overflow-y:auto;line-height:1.8"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Manual Control Panel -->
+  <div class="panel" id="manual">
+    <div class="card" style="max-width:500px;margin:0 auto">
+      <div class="card-title">Manual drive</div>
+      <div class="dpad">
+        <div class="dpad-btn empty"></div>
+        <button class="dpad-btn" id="btnFwd" onmousedown="manualDown('fwd')" onmouseup="manualUp()" ontouchstart="manualDown('fwd')" ontouchend="manualUp()">▲</button>
+        <div class="dpad-btn empty"></div>
+        <button class="dpad-btn" id="btnLeft" onmousedown="manualDown('left')" onmouseup="manualUp()" ontouchstart="manualDown('left')" ontouchend="manualUp()">◄</button>
+        <button class="dpad-btn dpad-center" id="btnDstop" onmousedown="manualDown('mstop')" onmouseup="manualUp()" ontouchstart="manualDown('mstop')" ontouchend="manualUp()">STOP</button>
+        <button class="dpad-btn" id="btnRight" onmousedown="manualDown('right')" onmouseup="manualUp()" ontouchstart="manualDown('right')" ontouchend="manualUp()">►</button>
+        <div class="dpad-btn empty"></div>
+        <button class="dpad-btn" id="btnRev" onmousedown="manualDown('rev')" onmouseup="manualUp()" ontouchstart="manualDown('rev')" ontouchend="manualUp()">▼</button>
+        <div class="dpad-btn empty"></div>
+      </div>
+      <div class="speed-control">
+        <label>Speed</label>
+        <input type="range" min="60" max="200" value="120" id="speedSlider" oninput="updateSpeed()">
+        <span class="speed-val" id="speedVal">120</span>
+      </div>
+      <div class="manual-note">Hold buttons to drive. Release to stop. Use keyboard arrows or WASD too.</div>
+    </div>
+  </div>
+
+  <!-- Logs Panel -->
+  <div class="panel" id="logs">
+    <div class="card">
+      <div class="log-toolbar">
+        <button class="btn-log" onclick="clearLogs()">Clear</button>
+        <button class="btn-log" onclick="exportLogs()">Export</button>
+        <button class="btn-log" id="btnAutoscroll" onclick="toggleAutoscroll()" style="color:var(--acc);border-color:var(--acc)">Autoscroll: ON</button>
+        <span class="log-count" id="logCount">0 lines</span>
+      </div>
+      <div class="log-container" id="logContainer"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    ECNG 4504 — Embedded Systems for Wireless Communications — Spring 2026 — AUC
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════
+// BLE CONFIG
+// ═══════════════════════════════════════
+const SERVICE_UUID      = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CMD_CHAR_UUID     = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const LOG_CHAR_UUID     = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
+const SENSOR_CHAR_UUID  = 'beb5483e-36e1-4688-b7f5-ea07361b26aa';
+const STATUS_CHAR_UUID  = 'beb5483e-36e1-4688-b7f5-ea07361b26ab';
+
+let device = null;
+let server = null;
+let cmdChar = null;
+let connected = false;
+let autoscroll = true;
+let logs = [];
+let junctionCount = 0;
+
+// ═══════════════════════════════════════
+// BLE CONNECTION
+// ═══════════════════════════════════════
+async function toggleConnection() {
+  if (connected) {
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    setDisconnected();
+    return;
+  }
+  try {
+    addLog('[BLE] Scanning for Maze Robot...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'MazeRobot' }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', () => {
+      addLog('[BLE] Disconnected');
+      setDisconnected();
+    });
+
+    addLog('[BLE] Connecting...');
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    // Command characteristic (write)
+    cmdChar = await service.getCharacteristic(CMD_CHAR_UUID);
+
+    // Log characteristic (notify)
+    const logChar = await service.getCharacteristic(LOG_CHAR_UUID);
+    await logChar.startNotifications();
+    logChar.addEventListener('characteristicvaluechanged', onLogData);
+
+    // Sensor characteristic (notify)
+    const sensorChar = await service.getCharacteristic(SENSOR_CHAR_UUID);
+    await sensorChar.startNotifications();
+    sensorChar.addEventListener('characteristicvaluechanged', onSensorData);
+
+    // Status characteristic (notify)
+    const statusChar = await service.getCharacteristic(STATUS_CHAR_UUID);
+    await statusChar.startNotifications();
+    statusChar.addEventListener('characteristicvaluechanged', onStatusData);
+
+    setConnected();
+    addLog('[BLE] Connected to MazeRobot');
+  } catch (err) {
+    addLog('[BLE] Error: ' + err.message, 'err');
+  }
+}
+
+function setConnected() {
+  connected = true;
+  document.getElementById('connDot').classList.add('on');
+  document.getElementById('connLabel').textContent = 'Connected';
+  const btn = document.getElementById('btnConnect');
+  btn.textContent = 'Disconnect';
+  btn.classList.add('connected');
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnBack').disabled = false;
+  document.getElementById('btnStop').disabled = false;
+}
+
+function setDisconnected() {
+  connected = false;
+  document.getElementById('connDot').classList.remove('on');
+  document.getElementById('connLabel').textContent = 'Disconnected';
+  const btn = document.getElementById('btnConnect');
+  btn.textContent = 'Connect';
+  btn.classList.remove('connected');
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnBack').disabled = true;
+  document.getElementById('btnStop').disabled = true;
+  cmdChar = null;
+}
+
+// ═══════════════════════════════════════
+// SEND COMMAND
+// ═══════════════════════════════════════
+async function sendCmd(cmd) {
+  if (!cmdChar) return;
+  try {
+    const encoder = new TextEncoder();
+    await cmdChar.writeValue(encoder.encode(cmd));
+    addLog('[CMD] → ' + cmd);
+  } catch (err) {
+    addLog('[CMD] Send failed: ' + err.message, 'err');
+  }
+}
+
+// ═══════════════════════════════════════
+// BLE DATA HANDLERS
+// ═══════════════════════════════════════
+function onLogData(event) {
+  const decoder = new TextDecoder();
+  const text = decoder.decode(event.target.value).trim();
+  if (!text) return;
+
+  // Detect log type for coloring
+  let cls = '';
+  if (text.includes('[JCT]') || text.includes('[SETTLE]') || text.includes('[ENTRY]')) cls = 'jct';
+  else if (text.includes('[TURN]') || text.includes('[CHOSEN]')) cls = 'turn';
+  else if (text.includes('GOAL')) cls = 'goal';
+  else if (text.includes('FAIL') || text.includes('ERROR')) cls = 'err';
+  else if (text.includes('PATH') || text.includes('Simplified') || text.includes('Return')) cls = 'path';
+
+  addLog(text, cls);
+
+  // Parse path data
+  if (text.startsWith('>>> PATH RECORDED:')) {
+    document.getElementById('rawPath').textContent = text.split(':')[1].trim();
+    junctionCount = (text.match(/[LRSB]/g) || []).length;
+    document.getElementById('jctCount').textContent = junctionCount;
+  }
+  if (text.startsWith('Simplified:')) {
+    document.getElementById('simpPath').textContent = text.split(':')[1].trim().split(' ')[0];
+  }
+  if (text.startsWith('Return')) {
+    const parts = text.split(':');
+    if (parts.length > 1) document.getElementById('retPath').textContent = parts[1].trim().split(' ')[0];
+  }
+}
+
+function onSensorData(event) {
+  const decoder = new TextDecoder();
+  const data = decoder.decode(event.target.value).trim();
+  // Expected format: "01100" (5 chars, 0 or 1)
+  if (data.length >= 5) {
+    const ids = ['sA','sB','sC','sD','sE'];
+    for (let i = 0; i < 5; i++) {
+      const el = document.getElementById(ids[i]);
+      if (data[i] === '1') el.classList.add('on');
+      else el.classList.remove('on');
+    }
+  }
+}
+
+function onStatusData(event) {
+  const decoder = new TextDecoder();
+  const status = decoder.decode(event.target.value).trim().toLowerCase();
+  const el = document.getElementById('stageVal');
+  el.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  el.className = 'value ' + status;
+
+  const modeEl = document.getElementById('modeVal');
+  if (status === 'training') { modeEl.textContent = 'LHR explore'; modeEl.style.color = 'var(--amber)'; }
+  else if (status === 'solving') { modeEl.textContent = 'Return run'; modeEl.style.color = 'var(--blue)'; }
+  else if (status === 'idle') { modeEl.textContent = '—'; modeEl.style.color = 'var(--tx3)'; }
+  else { modeEl.textContent = status; modeEl.style.color = 'var(--acc)'; }
+}
+
+// ═══════════════════════════════════════
+// MANUAL CONTROL
+// ═══════════════════════════════════════
+let manualInterval = null;
+
+function manualDown(dir) {
+  sendCmd(dir);
+  // Repeat while held
+  manualInterval = setInterval(() => sendCmd(dir), 200);
+  // Visual
+  const map = {fwd:'btnFwd',left:'btnLeft',right:'btnRight',rev:'btnRev',mstop:'btnDstop'};
+  if (map[dir]) document.getElementById(map[dir]).classList.add('pressed');
+}
+
+function manualUp() {
+  clearInterval(manualInterval);
+  manualInterval = null;
+  sendCmd('mstop');
+  document.querySelectorAll('.dpad-btn').forEach(b => b.classList.remove('pressed'));
+}
+
+function updateSpeed() {
+  const v = document.getElementById('speedSlider').value;
+  document.getElementById('speedVal').textContent = v;
+  sendCmd('spd:' + v);
+}
+
+// Keyboard support
+const keyMap = { ArrowUp:'fwd', ArrowDown:'rev', ArrowLeft:'left', ArrowRight:'right',
+                 w:'fwd', s:'rev', a:'left', d:'right', ' ':'mstop' };
+const keysDown = new Set();
+
+document.addEventListener('keydown', e => {
+  const dir = keyMap[e.key];
+  if (dir && !keysDown.has(e.key)) {
+    keysDown.add(e.key);
+    sendCmd(dir);
+    const map = {fwd:'btnFwd',left:'btnLeft',right:'btnRight',rev:'btnRev',mstop:'btnDstop'};
+    if (map[dir]) document.getElementById(map[dir]).classList.add('pressed');
+  }
+});
+
+document.addEventListener('keyup', e => {
+  const dir = keyMap[e.key];
+  if (dir && keysDown.has(e.key)) {
+    keysDown.delete(e.key);
+    if (keysDown.size === 0) sendCmd('mstop');
+    const map = {fwd:'btnFwd',left:'btnLeft',right:'btnRight',rev:'btnRev',mstop:'btnDstop'};
+    if (map[dir]) document.getElementById(map[dir]).classList.remove('pressed');
+  }
+});
+
+// Prevent touch scrolling on dpad
+document.querySelectorAll('.dpad-btn').forEach(b => {
+  b.addEventListener('touchstart', e => e.preventDefault(), {passive:false});
+});
+
+// ═══════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════
+function addLog(text, cls='') {
+  const now = new Date();
+  const ts = now.toLocaleTimeString('en-US', {hour12:false}) + '.' + String(now.getMilliseconds()).padStart(3,'0');
+  logs.push({ts, text, cls});
+
+  // Full log
+  const container = document.getElementById('logContainer');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  line.innerHTML = `<span class="ts">${ts}</span><span class="msg ${cls}">${escHtml(text)}</span>`;
+  container.appendChild(line);
+  if (autoscroll) container.scrollTop = container.scrollHeight;
+  document.getElementById('logCount').textContent = logs.length + ' lines';
+
+  // Mini log (last 10)
+  const mini = document.getElementById('miniLog');
+  const miniLine = document.createElement('div');
+  miniLine.innerHTML = `<span style="color:var(--tx3)">${ts.slice(-8)}</span> <span style="color:${cls==='err'?'var(--red)':cls==='goal'?'var(--acc)':'var(--tx2)'}">${escHtml(text)}</span>`;
+  mini.appendChild(miniLine);
+  while (mini.children.length > 10) mini.removeChild(mini.firstChild);
+  mini.scrollTop = mini.scrollHeight;
+}
+
+function escHtml(t) {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function clearLogs() {
+  logs = [];
+  document.getElementById('logContainer').innerHTML = '';
+  document.getElementById('logCount').textContent = '0 lines';
+  addLog('[SYS] Logs cleared');
+}
+
+function exportLogs() {
+  const text = logs.map(l => `[${l.ts}] ${l.text}`).join('\n');
+  const blob = new Blob([text], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'maze_robot_log_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.txt';
+  a.click();
+}
+
+function toggleAutoscroll() {
+  autoscroll = !autoscroll;
+  const btn = document.getElementById('btnAutoscroll');
+  btn.textContent = 'Autoscroll: ' + (autoscroll ? 'ON' : 'OFF');
+  btn.style.color = autoscroll ? 'var(--acc)' : 'var(--tx3)';
+  btn.style.borderColor = autoscroll ? 'var(--acc)' : 'var(--border)';
+}
+
+// ═══════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════
+function switchTab(id, el) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  el.classList.add('active');
+}
+
+// Init
+addLog('[SYS] Maze Robot Control loaded');
+addLog('[SYS] Click "Connect" to pair via BLE');
+</script>
+</body>
+</html>
